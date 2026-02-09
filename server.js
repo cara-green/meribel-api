@@ -436,10 +436,9 @@ function getMockWeatherWarnings() {
   return {
     department: 'Savoie',
     updateTime: new Date().toISOString(),
-    alerts: [],  // Empty array - no alerts to show
+    alerts: [],  // ← CHANGE THIS LINE - make it an empty array
     source: 'https://vigilance.meteofrance.fr/fr/savoie',
-    isMockData: true,
-    message: 'No current weather warnings available'
+    isMockData: true
   };
 }
 
