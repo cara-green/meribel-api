@@ -436,15 +436,7 @@ function getMockWeatherWarnings() {
   return {
     department: 'Savoie',
     updateTime: new Date().toISOString(),
-    alerts: [
-      {
-        type: 'avalanche',
-        level: 'orange',
-        levelNumber: 3,
-        title: 'Avalanche Risk - Level 3',
-        description: 'Considerable avalanche risk in mountain areas. Unfavorable conditions for backcountry activities.'
-      }
-    ],
+    alerts: [], // Return empty array instead of generic warning
     source: 'https://vigilance.meteofrance.fr/fr/savoie',
     isMockData: true
   };
