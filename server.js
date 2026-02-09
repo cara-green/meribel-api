@@ -7,6 +7,18 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 
 const app = express();
+// Add this near the top, after const app = express();
+app.get('/', (req, res) => {
+  res.json({
+    message: '🏔️ Méribel Avalanche API',
+    status: 'running',
+    endpoints: {
+      health: '/api/health',
+      avalanche: '/api/avalanche/vanoise',
+      warnings: '/api/warnings/savoie'
+    }
+  });
+});
 app.use(cors());
 app.use(express.json());
 
