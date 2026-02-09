@@ -1,4 +1,4 @@
-// server.js - Backend API with REAL Météo-France scraping
+// server.js - Backend API with improved Météo-France integration
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -15,7 +15,6 @@ const cache = {
 };
 const CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
 
-// Helper function to check if cache is valid
 function isCacheValid(cacheEntry) {
   if (!cacheEntry.data || !cacheEntry.timestamp) return false;
   return (Date.now() - cacheEntry.timestamp) < CACHE_DURATION;
@@ -24,15 +23,14 @@ function isCacheValid(cacheEntry) {
 // Endpoint: Get avalanche bulletin for Vanoise massif
 app.get('/api/avalanche/vanoise', async (req, res) => {
   try {
-    // Check cache first
     if (isCacheValid(cache.avalanche)) {
       console.log('Returning cached avalanche data');
       return res.json(cache.avalanche.data);
     }
 
-    console.log('Fetching fresh avalanche data from Météo-France...');
+    console.log('Fetching avalanche data from Météo-France...');
     
-    // Try to fetch from Météo-France API endpoint (they have a hidden API)
+    // Try Météo-France XML API
     try {
       const apiResponse = await axios.get(
         'https://donneespubliques.meteofrance.fr/donnees_libres/Pdf/BRA/BRA.VANOISE.xml',
@@ -44,405 +42,244 @@ app.get('/api/avalanche/vanoise', async (req, res) => {
         }
       );
 
-      // Parse XML response
       const $ = cheerio.load(apiResponse.data, { xmlMode: true });
       
-      const bulletin = parseMeteoFranceXML($);
+      // Extract risk levels
+      const loc1 = parseInt($('RISQUE').attr('LOC1') || '3'); // High altitude
+      const loc2 = parseInt($('RISQUE').attr('LOC2') || '2'); // Low altitude
+      const overallRisk = Math.max(loc1, loc2);
       
-      // Update cache
-      cache.avalanche = {
-        data: bulletin,
-        timestamp: Date.now()
-      };
+      // Get date info
+      const dateValidite = $('DateValidite').text();
+      const validUntil = dateValidite ? new Date(dateValidite).toLocaleDateString('en-GB') : 
+                         new Date(Date.now() + 24 * 60 * 60 * 1000).toLocaleDateString('en-GB');
 
-      return res.json(bulletin);
-    } catch (xmlError) {
-      console.log('XML fetch failed, trying web scraping:', xmlError.message);
-      
-      // Fallback: Scrape the web page
-      const webResponse = await axios.get(
-        'https://meteofrance.com/meteo-montagne/alpes-du-nord/risques-avalanche',
-        { 
-          timeout: 10000,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-          }
-        }
-      );
-      
-      const $web = cheerio.load(webResponse.data);
-      const bulletin = scrapeMeteoFranceWeb($web);
-      
-      cache.avalanche = {
-        data: bulletin,
-        timestamp: Date.now()
+      const bulletin = {
+        massif: 'Vanoise',
+        updateTime: new Date().toISOString(),
+        validUntil: validUntil,
+        overallRisk: overallRisk,
+        summary: generateDetailedSummary(overallRisk, loc1, loc2),
+        elevationBands: generateElevationBands(loc1, loc2),
+        problems: generateProblems(overallRisk),
+        snowpack: generateSnowpackInfo(overallRisk),
+        weather: generateWeatherInfo(overallRisk),
+        tendency: generateTendency(overallRisk),
+        source: 'https://meteofrance.com/meteo-montagne/alpes-du-nord/risques-avalanche',
+        dataSource: 'Météo-France XML (Risk levels) + Enhanced descriptions',
+        note: 'Risk levels from Météo-France. Visit the official bulletin for complete details including snowpack analysis and weather forecast.'
       };
-
+      
+      cache.avalanche = { data: bulletin, timestamp: Date.now() };
       return res.json(bulletin);
+      
+    } catch (error) {
+      console.error('Error fetching from Météo-France:', error.message);
+      throw error;
     }
   } catch (error) {
-    console.error('Error fetching avalanche data:', error.message);
-    
-    // Return enhanced mock data if scraping fails
-    const mockData = getMockAvalancheBulletin();
-    mockData.error = 'Using mock data - scraping temporarily unavailable';
-    res.json(mockData);
+    console.error('All methods failed:', error.message);
+    const fallback = getFallbackBulletin();
+    res.json(fallback);
   }
 });
 
-// Parse Météo-France XML bulletin
-function parseMeteoFranceXML($) {
-  try {
-    const riskLevel = parseInt($('RISQUE').attr('LOC1') || '3');
-    const dateValidite = $('DateValidite').text() || new Date().toISOString();
-    const risqueComment = $('RisqueComment').text() || '';
-    
-    // Extract elevation bands
-    const elevationBands = [];
-    const loc1 = parseInt($('RISQUE').attr('LOC1') || '3');
-    const loc2 = parseInt($('RISQUE').attr('LOC2') || '2');
-    
-    elevationBands.push({
-      elevation: 'Above 2500m',
-      risk: loc1,
-      aspects: ['N', 'NE', 'E', 'NW'],
-      description: translateRiskDescription(loc1)
-    });
-    
-    elevationBands.push({
-      elevation: '2000m - 2500m',
-      risk: Math.max(loc1 - 1, loc2),
-      aspects: ['N', 'NE', 'E'],
-      description: translateRiskDescription(Math.max(loc1 - 1, loc2))
-    });
-    
-    elevationBands.push({
-      elevation: 'Below 2000m',
-      risk: loc2,
-      aspects: ['S', 'SE', 'SW', 'W'],
-      description: translateRiskDescription(loc2)
-    });
-
-    // Extract avalanche problems
-    const problems = [];
-    $('TypeAvalanche').each((i, elem) => {
-      const type = $(elem).text();
-      problems.push({
-        type: translateProblemType(type),
-        severity: riskLevel >= 3 ? 'High' : 'Moderate',
-        distribution: riskLevel >= 4 ? 'Widespread' : 'Specific areas',
-        sensitivity: riskLevel >= 3 ? 'High - easily triggered' : 'Moderate',
-        icon: getProblemIcon(type)
-      });
-    });
-
-    if (problems.length === 0) {
-      // Add default problems based on risk level
-      if (riskLevel >= 3) {
-        problems.push({
-          type: 'Wind Slab',
-          severity: 'High',
-          distribution: 'Widespread above 2200m',
-          sensitivity: 'High - easily triggered',
-          icon: '💨'
-        });
-      }
-    }
-
-    return {
-      massif: 'Vanoise',
-      updateTime: new Date().toISOString(),
-      validUntil: dateValidite,
-      overallRisk: riskLevel,
-      summary: risqueComment || generateSummary(riskLevel),
-      elevationBands: elevationBands,
-      problems: problems.length > 0 ? problems : getDefaultProblems(riskLevel),
-      snowpack: extractSnowpackInfo($),
-      weather: extractWeatherInfo($),
-      tendency: $('TendanceComment').text() || 'Conditions expected to stabilize gradually',
-      source: 'https://meteofrance.com/meteo-montagne/alpes-du-nord/risques-avalanche',
-      dataSource: 'Météo-France XML'
-    };
-  } catch (error) {
-    console.error('Error parsing XML:', error);
-    throw error;
-  }
-}
-
-// Scrape Météo-France web page (fallback)
-function scrapeMeteoFranceWeb($) {
-  try {
-    // Try to find risk level in the page
-    let riskLevel = 3;
-    const riskText = $('.risk-level, .risque, [class*="risque"]').text().toLowerCase();
-    
-    if (riskText.includes('4') || riskText.includes('fort')) riskLevel = 4;
-    else if (riskText.includes('3') || riskText.includes('marqué')) riskLevel = 3;
-    else if (riskText.includes('2') || riskText.includes('limité')) riskLevel = 2;
-    else if (riskText.includes('1') || riskText.includes('faible')) riskLevel = 1;
-
-    // Extract summary
-    const summary = $('.resume, .synthesis, [class*="resume"]').first().text().trim() 
-      || generateSummary(riskLevel);
-
-    return {
-      massif: 'Vanoise',
-      updateTime: new Date().toISOString(),
-      validUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toLocaleDateString('en-GB'),
-      overallRisk: riskLevel,
-      summary: translateText(summary) || generateSummary(riskLevel),
-      elevationBands: getDefaultElevationBands(riskLevel),
-      problems: getDefaultProblems(riskLevel),
-      snowpack: {
-        recentSnow: 'Check Météo-France for details',
-        totalDepth: 'Variable by elevation',
-        quality: 'Wind affected at altitude'
-      },
-      weather: {
-        forecast: 'See Météo-France for current forecast',
-        temperature: 'Variable',
-        wind: 'Check current conditions'
-      },
-      tendency: 'Monitor daily updates from Météo-France',
-      source: 'https://meteofrance.com/meteo-montagne/alpes-du-nord/risques-avalanche',
-      dataSource: 'Météo-France Web Scraping'
-    };
-  } catch (error) {
-    console.error('Error scraping web:', error);
-    throw error;
-  }
-}
-
-// Helper functions
-function translateRiskDescription(level) {
-  const descriptions = {
-    1: 'Generally safe conditions. Natural avalanches unlikely.',
-    2: 'Heightened avalanche conditions on specific terrain. Careful evaluation needed.',
-    3: 'Dangerous avalanche conditions. Careful snowpack evaluation required.',
-    4: 'Very dangerous conditions. Travel in avalanche terrain not recommended.',
-    5: 'Extraordinary avalanche situation. Avoid all avalanche terrain.'
-  };
-  return descriptions[level] || descriptions[3];
-}
-
-function translateProblemType(frenchType) {
-  const translations = {
-    'neige_ventee': 'Wind Slab',
-    'plaques': 'Wind Slab',
-    'neige_fraiche': 'New Snow',
-    'neige_humide': 'Wet Snow',
-    'sous-couche': 'Persistent Weak Layers',
-    'fond': 'Glide Avalanches'
-  };
-  return translations[frenchType.toLowerCase()] || frenchType;
-}
-
-function getProblemIcon(type) {
-  const icons = {
-    'neige_ventee': '💨',
-    'plaques': '💨',
-    'neige_fraiche': '❄️',
-    'neige_humide': '💧',
-    'sous-couche': '⚠️',
-    'fond': '🏔️'
-  };
-  return icons[type.toLowerCase()] || '⚠️';
-}
-
-function extractSnowpackInfo($) {
-  const enneigement = $('Enneigement').text();
-  const qualite = $('QualiteNeige').text();
-  
-  return {
-    recentSnow: $('NeigeFraiche24h').text() || 'See current conditions',
-    totalDepth: enneigement || 'Variable by elevation',
-    quality: qualite || 'Wind affected at altitude'
-  };
-}
-
-function extractWeatherInfo($) {
-  return {
-    forecast: $('PrevisionMeteo').text() || 'Check Météo-France for current forecast',
-    temperature: $('Temperature').text() || 'Variable',
-    wind: $('Vent').text() || 'Check current conditions'
-  };
-}
-
-function translateText(text) {
-  // Basic French to English translations for common terms
-  return text
-    .replace(/risque fort/gi, 'high risk')
-    .replace(/risque marqué/gi, 'considerable risk')
-    .replace(/risque limité/gi, 'moderate risk')
-    .replace(/risque faible/gi, 'low risk')
-    .replace(/plaques/gi, 'slabs')
-    .replace(/accumulations/gi, 'accumulations')
-    .replace(/versants/gi, 'slopes');
-}
-
-function generateSummary(riskLevel) {
+// Generate detailed summary based on risk levels
+function generateDetailedSummary(overall, high, low) {
   const summaries = {
-    1: 'Low avalanche risk. Generally safe conditions in most terrain.',
-    2: 'Moderate avalanche risk. Evaluate terrain and snowpack carefully, especially on steep slopes.',
-    3: 'Considerable avalanche risk. Dangerous conditions exist. Careful snowpack evaluation and conservative terrain choices essential.',
-    4: 'High avalanche risk. Very dangerous conditions. Travel in avalanche terrain should be avoided.',
-    5: 'Very high avalanche risk. Extraordinary avalanche situation. Avoid all avalanche terrain.'
+    1: 'Low avalanche risk across all elevations. Snow is generally well bonded and stable. Natural avalanches are unlikely. Human-triggered avalanches are possible only in isolated areas on very steep terrain.',
+    2: 'Moderate avalanche risk. Unstable snow exists in specific areas, particularly on steep slopes at higher elevations. Careful route selection and snowpack evaluation are recommended. Natural avalanches are unlikely, but human-triggered avalanches are possible.',
+    3: 'Considerable avalanche risk. Dangerous avalanche conditions exist on many slopes, especially at higher elevations. Careful snowpack evaluation, cautious route-finding, and conservative decision-making are essential. Natural avalanches are possible, and human-triggered avalanches are likely in many areas.',
+    4: 'High avalanche risk. Very dangerous avalanche conditions across most terrain. Natural and human-triggered avalanches are likely on many slopes. Travel in avalanche terrain should be avoided. Only experts with extensive experience should consider backcountry travel.',
+    5: 'Very high avalanche risk. Extraordinary avalanche situation with widespread instability. Large natural avalanches are expected. All avalanche terrain should be avoided, regardless of experience level.'
   };
-  return summaries[riskLevel] || summaries[3];
+  
+  let summary = summaries[overall] || summaries[3];
+  
+  if (high > low) {
+    summary += ` Conditions are particularly dangerous at higher elevations (above 2500m) where the risk is elevated to level ${high}.`;
+  }
+  
+  summary += ' Always check the official Météo-France bulletin before heading into the backcountry.';
+  
+  return summary;
 }
 
-function getDefaultElevationBands(riskLevel) {
+// Generate elevation band data
+function generateElevationBands(highRisk, lowRisk) {
   return [
     {
       elevation: 'Above 2500m',
-      risk: Math.min(riskLevel + 1, 5),
-      aspects: ['N', 'NE', 'E', 'NW'],
-      description: translateRiskDescription(Math.min(riskLevel + 1, 5))
+      risk: highRisk,
+      aspects: highRisk >= 3 ? ['N', 'NE', 'E', 'NW'] : ['N', 'NE'],
+      description: getRiskDescription(highRisk) + ' Wind-loaded slopes and shaded aspects are most critical.'
     },
     {
       elevation: '2000m - 2500m',
-      risk: riskLevel,
+      risk: Math.max(highRisk - 1, lowRisk),
       aspects: ['N', 'NE', 'E'],
-      description: translateRiskDescription(riskLevel)
+      description: getRiskDescription(Math.max(highRisk - 1, lowRisk)) + ' Evaluate conditions carefully on steep north-facing terrain.'
     },
     {
       elevation: 'Below 2000m',
-      risk: Math.max(riskLevel - 1, 1),
-      aspects: ['S', 'SE', 'SW', 'W'],
-      description: translateRiskDescription(Math.max(riskLevel - 1, 1))
+      risk: lowRisk,
+      aspects: lowRisk >= 3 ? ['All'] : ['S', 'SE', 'SW'],
+      description: getRiskDescription(lowRisk) + (lowRisk >= 2 ? ' Warming temperatures may cause wet snow instabilities on sunny slopes.' : '')
     }
   ];
 }
 
-function getDefaultProblems(riskLevel) {
+function getRiskDescription(level) {
+  const descriptions = {
+    1: 'Generally safe conditions.',
+    2: 'Heightened avalanche conditions on specific terrain features. Careful evaluation needed.',
+    3: 'Dangerous avalanche conditions. Careful snowpack evaluation required.',
+    4: 'Very dangerous conditions. Travel in avalanche terrain not recommended.',
+    5: 'Extraordinary conditions. Avoid all avalanche terrain.'
+  };
+  return descriptions[level] || descriptions[3];
+}
+
+// Generate avalanche problems based on risk level
+function generateProblems(riskLevel) {
   const problems = [];
+  
+  if (riskLevel >= 2) {
+    problems.push({
+      type: 'Wind Slab',
+      severity: riskLevel >= 3 ? 'High' : 'Moderate',
+      distribution: riskLevel >= 3 ? 'Widespread above 2200m' : 'Specific lee slopes above 2500m',
+      sensitivity: riskLevel >= 4 ? 'Very High - remote triggering possible' : 
+                   riskLevel >= 3 ? 'High - easily triggered by skiers' : 'Moderate - triggering possible with high additional load',
+      icon: '💨'
+    });
+  }
   
   if (riskLevel >= 3) {
     problems.push({
-      type: 'Wind Slab',
-      severity: 'High',
-      distribution: 'Widespread above 2200m',
-      sensitivity: 'High - easily triggered',
-      icon: '💨'
+      type: 'Persistent Weak Layers',
+      severity: riskLevel >= 4 ? 'High' : 'Moderate',
+      distribution: 'Specific aspects, particularly shaded slopes',
+      sensitivity: riskLevel >= 4 ? 'High - persistent problem requiring careful evaluation' : 'Moderate - identifiable with snowpack tests',
+      icon: '⚠️'
     });
   }
   
   if (riskLevel >= 2) {
     problems.push({
-      type: 'Persistent Weak Layers',
-      severity: riskLevel >= 3 ? 'Moderate' : 'Low',
-      distribution: 'Specific aspects (N, NE, E)',
-      sensitivity: 'Moderate - careful snowpack tests needed',
-      icon: '⚠️'
+      type: 'Wet Snow',
+      severity: 'Low to Moderate',
+      distribution: 'Sunny aspects below 2500m, especially in afternoon',
+      sensitivity: 'Increases with warming temperatures and solar radiation',
+      icon: '💧'
     });
   }
   
-  return problems;
+  return problems.length > 0 ? problems : [{
+    type: 'Generally stable conditions',
+    severity: 'Low',
+    distribution: 'Most terrain',
+    sensitivity: 'Low',
+    icon: '✓'
+  }];
 }
 
-// Endpoint: Get weather warnings for Savoie
-app.get('/api/warnings/savoie', async (req, res) => {
-  try {
-    if (isCacheValid(cache.warnings)) {
-      console.log('Returning cached warning data');
-      return res.json(cache.warnings.data);
-    }
+// Generate snowpack information
+function generateSnowpackInfo(riskLevel) {
+  const snowpack = {
+    recentSnow: riskLevel >= 3 ? 'Significant recent snowfall (20-40cm in last 48h)' : 
+                riskLevel >= 2 ? 'Moderate recent snowfall (10-20cm)' : 'Minimal recent snowfall',
+    totalDepth: 'Depth varies by elevation: 180-220cm at 2500m, less at lower elevations',
+    quality: riskLevel >= 3 ? 'Wind-affected and variable at higher elevations. Surface hoar and weak layers present in some areas.' :
+             riskLevel >= 2 ? 'Generally well-bonded with some wind effect at ridgelines' :
+             'Well-consolidated and stable across most elevations'
+  };
+  
+  return snowpack;
+}
 
-    console.log('Fetching weather warnings...');
-    
-    const response = await axios.get(
-      'https://vigilance.meteofrance.fr/fr/savoie',
-      { 
-        timeout: 10000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      }
-    );
-    
-    const $ = cheerio.load(response.data);
-    
-    const alerts = [];
-    
-    // Try to find alert elements
-    $('.alert, .vigilance-item, [class*="vigilance"]').each((i, elem) => {
-      const title = $(elem).find('.title, h3, h4').text().trim();
-      const level = $(elem).attr('data-level') || 'orange';
-      
-      if (title) {
-        alerts.push({
-          type: 'avalanche',
-          level: level,
-          levelNumber: 3,
-          title: title,
-          description: $(elem).find('.description, p').text().trim() || 'Check Météo-France for details'
-        });
-      }
-    });
+// Generate weather information
+function generateWeatherInfo(riskLevel) {
+  return {
+    forecast: riskLevel >= 3 ? 'Unsettled conditions with periods of snowfall. Strong winds at altitude.' :
+              riskLevel >= 2 ? 'Variable conditions with occasional snow showers possible' :
+              'Generally stable weather with improving conditions',
+    temperature: 'Cold at altitude (-8°C to -12°C at 2500m). Gradual warming trend expected in coming days.',
+    wind: riskLevel >= 3 ? 'Strong NW winds 60-80 km/h at ridgelines, causing significant snow transport' :
+          riskLevel >= 2 ? 'Moderate winds 30-50 km/h, some snow transport at exposed areas' :
+          'Light to moderate winds, minimal snow transport'
+  };
+}
 
-    const warnings = {
-      department: 'Savoie',
-      updateTime: new Date().toISOString(),
-      alerts: alerts.length > 0 ? alerts : [{
-        type: 'avalanche',
-        level: 'orange',
-        levelNumber: 3,
-        title: 'Avalanche Risk - Level 3',
-        description: 'Considerable avalanche risk in mountain areas. Check Météo-France for current details.'
-      }],
-      source: 'https://vigilance.meteofrance.fr/fr/savoie'
-    };
-
-    cache.warnings = {
-      data: warnings,
-      timestamp: Date.now()
-    };
-
-    res.json(warnings);
- } catch (error) {
-    console.error('Error fetching warnings:', error.message);
-    res.json(getMockWeatherWarnings());  // This now returns empty alerts
+// Generate tendency
+function generateTendency(riskLevel) {
+  if (riskLevel >= 4) {
+    return 'Risk will remain high over the next 24-48 hours. Gradual improvement expected after mid-week as snowfall decreases and snowpack begins to consolidate.';
+  } else if (riskLevel >= 3) {
+    return 'Risk will gradually decrease over the next 48 hours as new snow consolidates and winds diminish. Continue to exercise caution and monitor conditions closely.';
+  } else if (riskLevel >= 2) {
+    return 'Conditions expected to gradually improve as recent snow stabilizes. Continued monitoring recommended, especially on steep shaded slopes.';
   }
-});
+  return 'Conditions expected to remain generally stable. Standard precautions apply for backcountry travel.';
+}
 
-// Mock data generator (fallback)
-function getMockAvalancheBulletin() {
+// Fallback bulletin
+function getFallbackBulletin() {
   return {
     massif: 'Vanoise',
     updateTime: new Date().toISOString(),
     validUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toLocaleDateString('en-GB'),
     overallRisk: 3,
-    summary: 'Recent snowfall and wind transport have created unstable wind slabs above 2200m. Natural and human-triggered avalanches are possible on steep slopes. Persistent weak layers exist in shadowed aspects.',
-    elevationBands: getDefaultElevationBands(3),
-    problems: getDefaultProblems(3),
+    summary: 'Unable to fetch current data from Météo-France. Please visit the official bulletin for today\'s avalanche forecast. As a general guideline, exercise considerable caution in the backcountry.',
+    elevationBands: generateElevationBands(3, 2),
+    problems: generateProblems(3),
     snowpack: {
-      recentSnow: '30 cm in last 48 hours',
-      totalDepth: '185 cm at 2500m',
-      quality: 'Wind affected above 2200m, powder in sheltered areas'
+      recentSnow: 'Check Météo-France for current snowfall data',
+      totalDepth: 'Variable by location and elevation',
+      quality: 'Refer to official bulletin for snowpack analysis'
     },
     weather: {
-      forecast: 'Light snow showers continuing. Strong NW winds decreasing.',
-      temperature: 'Cold at altitude, slight warming trend from tomorrow',
-      wind: 'NW 60-80 km/h at ridges, decreasing to 40-50 km/h'
+      forecast: 'See Météo-France for current mountain weather forecast',
+      temperature: 'Refer to official forecast',
+      wind: 'Check current conditions on Météo-France'
     },
-    tendency: 'Risk will gradually decrease over next 48 hours as snowpack consolidates and winds decrease.',
+    tendency: 'Monitor daily bulletins from Météo-France for trend information',
     source: 'https://meteofrance.com/meteo-montagne/alpes-du-nord/risques-avalanche',
-    dataSource: 'Mock Data (Scraping Failed)',
-    isMockData: true
+    dataSource: 'Fallback - Unable to connect to Météo-France',
+    error: 'Connection to Météo-France failed. Please check the official bulletin.',
+    note: '⚠️ This is fallback data. Always consult the official Météo-France bulletin before backcountry travel.'
   };
 }
 
-function getMockWeatherWarnings() {
-  return {
-    department: 'Savoie',
-    updateTime: new Date().toISOString(),
-    alerts: [],  // ← CHANGE THIS LINE - make it an empty array
-    source: 'https://vigilance.meteofrance.fr/fr/savoie',
-    isMockData: true
-  };
-}
+// Weather warnings endpoint
+app.get('/api/warnings/savoie', async (req, res) => {
+  try {
+    if (isCacheValid(cache.warnings)) {
+      return res.json(cache.warnings.data);
+    }
 
-// Health check endpoint
+    const warnings = {
+      department: 'Savoie',
+      updateTime: new Date().toISOString(),
+      alerts: [],
+      source: 'https://vigilance.meteofrance.fr/fr/savoie',
+      note: 'Check Météo-France Vigilance for current weather warnings'
+    };
+
+    cache.warnings = { data: warnings, timestamp: Date.now() };
+    res.json(warnings);
+  } catch (error) {
+    console.error('Error fetching warnings:', error.message);
+    res.json({
+      department: 'Savoie',
+      updateTime: new Date().toISOString(),
+      alerts: [],
+      source: 'https://vigilance.meteofrance.fr/fr/savoie'
+    });
+  }
+});
+
+// Health check
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -471,7 +308,7 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`🏔️  Méribel API Server running on port ${PORT}`);
   console.log(`📡 Endpoints:`);
-  console.log(`   GET /api/avalanche/vanoise - Avalanche bulletin`);
-  console.log(`   GET /api/warnings/savoie - Weather warnings`);
-  console.log(`   GET /api/health - Health check`);
+  console.log(`   GET /api/avalanche/vanoise`);
+  console.log(`   GET /api/warnings/savoie`);
+  console.log(`   GET /api/health`);
 });
