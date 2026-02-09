@@ -399,9 +399,9 @@ app.get('/api/warnings/savoie', async (req, res) => {
     };
 
     res.json(warnings);
-  } catch (error) {
+ } catch (error) {
     console.error('Error fetching warnings:', error.message);
-    res.json(getMockWeatherWarnings());
+    res.json(getMockWeatherWarnings());  // This now returns empty alerts
   }
 });
 
@@ -436,9 +436,10 @@ function getMockWeatherWarnings() {
   return {
     department: 'Savoie',
     updateTime: new Date().toISOString(),
-    alerts: [], // Return empty array instead of generic warning
+    alerts: [],  // Empty array - no alerts to show
     source: 'https://vigilance.meteofrance.fr/fr/savoie',
-    isMockData: true
+    isMockData: true,
+    message: 'No current weather warnings available'
   };
 }
 
