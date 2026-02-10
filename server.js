@@ -1,4 +1,4 @@
-// server.js - Backend API with improved Météo-France integration
+// server.js - Backend API with improved Météo-France integration + Extended Forecast
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -11,13 +11,197 @@ app.use(express.json());
 // Cache configuration
 const cache = {
   avalanche: { data: null, timestamp: null },
-  warnings: { data: null, timestamp: null }
+  warnings: { data: null, timestamp: null },
+  extendedForecast: { data: null, timestamp: null }
 };
 const CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
 
 function isCacheValid(cacheEntry) {
   if (!cacheEntry.data || !cacheEntry.timestamp) return false;
   return (Date.now() - cacheEntry.timestamp) < CACHE_DURATION;
+}
+
+// NEW ENDPOINT: Extended weather forecast for trip planning
+app.get('/api/forecast/extended', async (req, res) => {
+  try {
+    const { lat, lon, days } = req.query;
+    
+    // Default to Méribel coordinates if not provided
+    const latitude = lat || 45.4;
+    const longitude = lon || 6.57;
+    const forecastDays = Math.min(parseInt(days) || 7, 16); // Max 16 days
+
+    // Check cache
+    const cacheKey = `${latitude}_${longitude}_${forecastDays}`;
+    if (isCacheValid(cache.extendedForecast) && cache.extendedForecast.cacheKey === cacheKey) {
+      console.log('Returning cached extended forecast');
+      return res.json(cache.extendedForecast.data);
+    }
+
+    console.log(`Fetching ${forecastDays}-day forecast for lat: ${latitude}, lon: ${longitude}`);
+
+    // Fetch from Open-Meteo API
+    const response = await axios.get('https://api.open-meteo.com/v1/forecast', {
+      params: {
+        latitude,
+        longitude,
+        daily: [
+          'temperature_2m_max',
+          'temperature_2m_min',
+          'snowfall_sum',
+          'precipitation_sum',
+          'windspeed_10m_max',
+          'windgusts_10m_max',
+          'weathercode'
+        ].join(','),
+        hourly: [
+          'temperature_2m',
+          'snowfall',
+          'windspeed_10m',
+          'weathercode'
+        ].join(','),
+        timezone: 'Europe/Paris',
+        forecast_days: forecastDays
+      },
+      timeout: 10000
+    });
+
+    const data = response.data;
+
+    // Process daily forecast
+    const dailyForecast = [];
+    for (let i = 0; i < forecastDays; i++) {
+      const date = new Date(data.daily.time[i]);
+      const dayData = {
+        date: data.daily.time[i],
+        dayName: date.toLocaleDateString('en-US', { weekday: 'long' }),
+        dayShort: date.toLocaleDateString('en-US', { weekday: 'short' }),
+        tempHigh: Math.round(data.daily.temperature_2m_max[i]),
+        tempLow: Math.round(data.daily.temperature_2m_min[i]),
+        snowfall: Math.round(data.daily.snowfall_sum[i] * 10) / 10, // Round to 1 decimal
+        precipitation: Math.round(data.daily.precipitation_sum[i] * 10) / 10,
+        windSpeed: Math.round(data.daily.windspeed_10m_max[i]),
+        windGusts: Math.round(data.daily.windgusts_10m_max[i]),
+        weatherCode: data.daily.weathercode[i],
+        conditions: getWeatherDescription(data.daily.weathercode[i]),
+        freezingLevel: estimateFreezingLevel(data.daily.temperature_2m_max[i]),
+        avalancheRisk: estimateAvalancheRisk(
+          data.daily.snowfall_sum[i],
+          data.daily.windspeed_10m_max[i],
+          data.daily.temperature_2m_max[i]
+        )
+      };
+
+      // Add hourly data for this day
+      const startHour = i * 24;
+      const endHour = startHour + 24;
+      dayData.hourly = [];
+      
+      for (let h = startHour; h < endHour && h < data.hourly.time.length; h += 3) {
+        const hourTime = new Date(data.hourly.time[h]);
+        dayData.hourly.push({
+          time: hourTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+          temp: Math.round(data.hourly.temperature_2m[h]),
+          snow: Math.round(data.hourly.snowfall[h] * 10) / 10,
+          wind: Math.round(data.hourly.windspeed_10m[h]),
+          weatherCode: data.hourly.weathercode[h]
+        });
+      }
+
+      dailyForecast.push(dayData);
+    }
+
+    const forecastData = {
+      location: {
+        latitude,
+        longitude,
+        name: 'Méribel' // You could geocode this
+      },
+      updateTime: new Date().toISOString(),
+      forecastDays,
+      daily: dailyForecast,
+      source: 'Open-Meteo API',
+      timezone: data.timezone
+    };
+
+    // Cache the result
+    cache.extendedForecast = { 
+      data: forecastData, 
+      timestamp: Date.now(),
+      cacheKey 
+    };
+
+    res.json(forecastData);
+
+  } catch (error) {
+    console.error('Error fetching extended forecast:', error.message);
+    res.status(500).json({
+      error: 'Failed to fetch extended forecast',
+      message: error.message
+    });
+  }
+});
+
+// Helper: Get weather description from WMO code
+function getWeatherDescription(code) {
+  const descriptions = {
+    0: 'Clear sky',
+    1: 'Mainly clear',
+    2: 'Partly cloudy',
+    3: 'Overcast',
+    45: 'Foggy',
+    48: 'Depositing rime fog',
+    51: 'Light drizzle',
+    53: 'Moderate drizzle',
+    55: 'Dense drizzle',
+    61: 'Slight rain',
+    63: 'Moderate rain',
+    65: 'Heavy rain',
+    71: 'Slight snow',
+    73: 'Moderate snow',
+    75: 'Heavy snow',
+    77: 'Snow grains',
+    80: 'Slight rain showers',
+    81: 'Moderate rain showers',
+    82: 'Violent rain showers',
+    85: 'Slight snow showers',
+    86: 'Heavy snow showers',
+    95: 'Thunderstorm',
+    96: 'Thunderstorm with slight hail',
+    99: 'Thunderstorm with heavy hail'
+  };
+  return descriptions[code] || 'Unknown';
+}
+
+// Helper: Estimate freezing level from temperature
+function estimateFreezingLevel(maxTemp) {
+  // Very rough estimate: freezing level = base altitude + (temp * lapse rate)
+  // Assuming base station at ~1500m and standard lapse rate of ~200m per degree
+  const baseAltitude = 1500;
+  const lapseRate = 150;
+  return baseAltitude + Math.round(maxTemp * lapseRate);
+}
+
+// Helper: Estimate avalanche risk
+function estimateAvalancheRisk(snowfall, windSpeed, temp) {
+  let risk = 'low';
+  
+  // Heavy snowfall increases risk
+  if (snowfall > 20) risk = 'considerable';
+  else if (snowfall > 10) risk = 'moderate';
+  
+  // Strong winds increase risk
+  if (windSpeed > 40) {
+    if (risk === 'moderate') risk = 'considerable';
+    else if (risk === 'low') risk = 'moderate';
+  }
+  
+  // Warming temps can increase risk
+  if (temp > 0 && snowfall > 5) {
+    if (risk === 'low') risk = 'moderate';
+  }
+  
+  return risk;
 }
 
 // Endpoint: Get avalanche bulletin for Vanoise massif
@@ -180,7 +364,7 @@ function generateProblems(riskLevel) {
     severity: 'Low',
     distribution: 'Most terrain',
     sensitivity: 'Low',
-    icon: '✓'
+    icon: '✔'
   }];
 }
 
@@ -286,7 +470,8 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     cache: {
       avalanche: cache.avalanche.timestamp ? new Date(cache.avalanche.timestamp).toISOString() : null,
-      warnings: cache.warnings.timestamp ? new Date(cache.warnings.timestamp).toISOString() : null
+      warnings: cache.warnings.timestamp ? new Date(cache.warnings.timestamp).toISOString() : null,
+      extendedForecast: cache.extendedForecast.timestamp ? new Date(cache.extendedForecast.timestamp).toISOString() : null
     }
   });
 });
@@ -299,7 +484,8 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/api/health',
       avalanche: '/api/avalanche/vanoise',
-      warnings: '/api/warnings/savoie'
+      warnings: '/api/warnings/savoie',
+      extendedForecast: '/api/forecast/extended?lat=45.4&lon=6.57&days=7'
     }
   });
 });
@@ -310,5 +496,6 @@ app.listen(PORT, () => {
   console.log(`📡 Endpoints:`);
   console.log(`   GET /api/avalanche/vanoise`);
   console.log(`   GET /api/warnings/savoie`);
+  console.log(`   GET /api/forecast/extended`);
   console.log(`   GET /api/health`);
 });
